@@ -5,7 +5,7 @@
 CREATE SCHEMA IF NOT EXISTS `PROJECT.DATASET`
 OPTIONS (location = 'EU');
 
--- Historical GL lines; must include join_key aligning with invoice_extractions.
+-- Historical GL lines — must include join_key aligning with invoice_extractions.
 CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.gl_lines` (
   join_key STRING NOT NULL OPTIONS (description = 'Stable key linking invoice line to GL'),
   gl_line_id STRING OPTIONS (description = 'Optional surrogate from source system'),

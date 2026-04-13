@@ -30,19 +30,35 @@ def run_schema_sql(sql_path: Path | None = None) -> None:
 
 
 def _split_sql_statements(sql: str) -> list[str]:
+    """Split on semicolons outside strings and outside ``--`` line comments."""
     parts: list[str] = []
     buf: list[str] = []
     in_single = False
     in_double = False
+    in_line_comment = False
     i = 0
     while i < len(sql):
         c = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+
+        if in_line_comment:
+            buf.append(c)
+            if c in "\n\r":
+                in_line_comment = False
+            i += 1
+            continue
+
         if c == "'" and not in_double:
             in_single = not in_single
             buf.append(c)
         elif c == '"' and not in_single:
             in_double = not in_double
             buf.append(c)
+        elif not in_single and not in_double and c == "-" and nxt == "-":
+            in_line_comment = True
+            buf.extend(["-", "-"])
+            i += 2
+            continue
         elif c == ";" and not in_single and not in_double:
             parts.append("".join(buf))
             buf = []
