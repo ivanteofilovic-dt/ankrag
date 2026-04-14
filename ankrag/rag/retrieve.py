@@ -32,7 +32,7 @@ def retrieve_similar_bigquery(
     if exclude_join_keys:
         sql = f"""
         SELECT join_key, invoice_line_id, document_id, line_index,
-               ML.DISTANCE(embedding, @q, COSINE) AS dist
+               ML.DISTANCE(embedding, @q, 'COSINE') AS dist
         FROM {table}
         WHERE join_key NOT IN UNNEST(@exclude)
         ORDER BY dist ASC
@@ -48,7 +48,7 @@ def retrieve_similar_bigquery(
     else:
         sql = f"""
         SELECT join_key, invoice_line_id, document_id, line_index,
-               ML.DISTANCE(embedding, @q, COSINE) AS dist
+               ML.DISTANCE(embedding, @q, 'COSINE') AS dist
         FROM {table}
         ORDER BY dist ASC
         LIMIT @k
