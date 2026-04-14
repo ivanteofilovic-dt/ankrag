@@ -22,8 +22,8 @@ def run_schema_sql(sql_path: Path | None = None) -> None:
     # Split on semicolons outside strings is fragile; run statement-by-statement for CREATE.
     statements = _split_sql_statements(sql)
     for stmt in statements:
-        stripped = stmt.strip()
-        if not stripped or stripped.startswith("--"):
+        stripped = _strip_leading_line_comments(stmt)
+        if not stripped:
             continue
         job = client.query(stripped)
         job.result()
@@ -70,6 +70,19 @@ def _split_sql_statements(sql: str) -> list[str]:
     return [p for p in parts if p.strip()]
 
 
+def _strip_leading_line_comments(sql: str) -> str:
+    """Drop leading ``--`` comment lines and blank lines so blocks are not skipped as 'comment-only'."""
+    lines = sql.splitlines()
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if not s or s.startswith("--"):
+            i += 1
+            continue
+        break
+    return "\n".join(lines[i:]).strip()
+
+
 def load_gl_csv_to_bigquery(
     gcs_uri: str,
     table_id: str = "gl_lines",
@@ -79,9 +92,12 @@ def load_gl_csv_to_bigquery(
     schema_file: Path | None = None,
 ) -> str:
     """
-    Load CSV (or wildcard gs://bucket/prefix/*.csv) into gl_lines.
+    Load comma-separated CSV (or wildcard ``gs://bucket/prefix/*.csv``) into ``gl_lines``.
 
-    For production, prefer an explicit schema JSON next to this repo (see sql/bigquery/gl_load_schema.json).
+    Tab-separated Oracle / subledger exports (``GL_YYYYMM.txt``) are not loaded here; use
+    ``ankrag.ingest.gl_oracle.load_oracle_gl_tsv_to_bigquery`` or ``ankrag load-gl --oracle-export``.
+
+    For production, prefer an explicit schema JSON (see ``sql/bigquery/gl_load_schema.json``).
     """
     settings = require_settings()
     client = bigquery.Client(project=settings.gcp_project, location=settings.bq_location)

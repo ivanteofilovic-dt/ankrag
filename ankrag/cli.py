@@ -54,22 +54,36 @@ def cmd_upload_file(
 
 @app.command("load-gl")
 def cmd_load_gl(
-    gcs_uri: str = typer.Argument(..., help="gs://bucket/path.csv or wildcard *.csv"),
+    source: str = typer.Argument(
+        ...,
+        help="Comma CSV: gs://bucket/path.csv (or wildcard). Tab GL export: use --oracle-export with local path or gs://.../GL_YYYYMM.txt",
+    ),
+    oracle_export: bool = typer.Option(
+        False,
+        "--oracle-export",
+        help="Source is tab-separated GL_*.txt (ENTITY, JOURNAL_NUMBER, BOOKING_DATE, …) transformed into gl_lines",
+    ),
     autodetect: bool = typer.Option(
         False,
-        help="Let BigQuery infer CSV schema (not recommended for production)",
+        help="Let BigQuery infer CSV schema (not recommended for production); ignored with --oracle-export",
     ),
 ) -> None:
     from pathlib import Path
 
     from ankrag.ingest.bq import load_gl_csv_to_bigquery
+    from ankrag.ingest.gl_oracle import load_oracle_gl_tsv_to_bigquery
 
     schema = Path(__file__).resolve().parents[1] / "sql" / "bigquery" / "gl_load_schema.json"
-    table = load_gl_csv_to_bigquery(
-        gcs_uri,
-        autodetect=autodetect,
-        schema_file=schema if schema.exists() and not autodetect else None,
-    )
+    if oracle_export:
+        p = Path(source)
+        loc: Path | str = source if source.startswith("gs://") else p
+        table = load_oracle_gl_tsv_to_bigquery(loc, schema_file=schema if schema.exists() else None)
+    else:
+        table = load_gl_csv_to_bigquery(
+            source,
+            autodetect=autodetect,
+            schema_file=schema if schema.exists() and not autodetect else None,
+        )
     typer.echo(f"Loaded into {table}")
 
 
