@@ -56,7 +56,11 @@ def extract_invoice_online(*, gcs_uri: str | None = None, local_pdf: Path | None
         response_mime_type="application/json",
         temperature=0.2,
     )
-    resp = client.models.generate_content(model=model, contents=[types.Content(parts=parts)], config=cfg)
+    resp = client.models.generate_content(
+        model=model,
+        contents=[types.Content(role="user", parts=parts)],
+        config=cfg,
+    )
     text = resp.text
     if not text:
         raise RuntimeError("Empty extraction response")
@@ -123,7 +127,7 @@ def suggest_coding_for_extraction(
     )
     resp = client.models.generate_content(
         model=model,
-        contents=[types.Content(parts=[types.Part.from_text(text=user)])],
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text=user)])],
         config=cfg,
     )
     if not resp.text:
