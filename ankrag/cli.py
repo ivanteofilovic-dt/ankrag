@@ -207,6 +207,41 @@ def cmd_export_vector_jsonl(
     typer.echo(f"Wrote {len(rows)} datapoints to {out}")
 
 
+@app.command("similar")
+def cmd_similar(
+    gcs_uri: str | None = typer.Option(None, help="gs://.../invoice.pdf"),
+    local_pdf: Path | None = typer.Option(None, exists=True, dir_okay=False),
+    top_k: int | None = typer.Option(None, help="Override RAG_TOP_K / settings.rag_top_k"),
+    quiet: bool = typer.Option(False, help="JSON on stdout only; skip neighbor INFO lines on stderr"),
+    include_embed_text: bool = typer.Option(False, help="Include full retrieval embed_text in JSON (can be long)"),
+) -> None:
+    """Extract invoice + embedding search only; no coding suggestion (no second Gemini call)."""
+    import logging
+
+    from ankrag.rag.suggest import similar_invoices_for_gcs_pdf, similar_invoices_for_local_pdf
+
+    if bool(gcs_uri) == bool(local_pdf):
+        raise typer.BadParameter("Provide exactly one of --gcs-uri or --local-pdf")
+    if not quiet:
+        logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    if gcs_uri:
+        payload = similar_invoices_for_gcs_pdf(
+            gcs_uri,
+            top_k=top_k,
+            log_neighbors=not quiet,
+            include_embed_text=include_embed_text,
+        )
+    else:
+        assert local_pdf is not None
+        payload = similar_invoices_for_local_pdf(
+            local_pdf,
+            top_k=top_k,
+            log_neighbors=not quiet,
+            include_embed_text=include_embed_text,
+        )
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
 @app.command("suggest")
 def cmd_suggest(
     gcs_uri: str | None = typer.Option(None, help="gs://.../invoice.pdf"),

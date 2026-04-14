@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from google import genai
 from google.genai import types
@@ -96,14 +100,12 @@ def _primary_line_for_embed(extraction: InvoiceExtractionResult) -> tuple[str, s
     return jk, t
 
 
-def suggest_coding_for_extraction(
+def _embed_and_retrieve_neighbors(
     extraction: InvoiceExtractionResult,
     *,
     exclude_join_keys: list[str] | None = None,
     top_k: int | None = None,
-    persist: bool = True,
-    gcs_uri: str | None = None,
-) -> tuple[CodingSuggestion, list[NeighborHit], dict[str, Any]]:
+) -> tuple[list[NeighborHit], dict[str, dict[str, Any]], list[str]]:
     settings = require_settings()
     k = top_k or settings.rag_top_k
     _, embed_txt = _primary_line_for_embed(extraction)
@@ -112,6 +114,159 @@ def suggest_coding_for_extraction(
     hits = retrieve_similar(qvec, top_k=k, exclude_join_keys=excl if excl else None)
     jks = list({h.join_key for h in hits})
     rows = fetch_training_rows_for_join_keys(jks)
+    return hits, rows, jks
+
+
+def _training_snippet(row: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "join_key",
+        "document_id",
+        "line_index",
+        "supplier",
+        "invoice_number",
+        "invoice_date",
+        "line_description",
+        "line_amount",
+        "currency",
+        "account",
+        "cost_center",
+        "product_code",
+        "gl_amount",
+        "posting_date",
+    )
+    out: dict[str, Any] = {}
+    for key in keys:
+        if key not in row:
+            continue
+        v = row[key]
+        if hasattr(v, "isoformat"):
+            v = v.isoformat()
+        elif isinstance(v, Decimal):
+            v = str(v)
+        out[key] = v
+    return out
+
+
+def similar_invoices_for_extraction(
+    extraction: InvoiceExtractionResult,
+    *,
+    gcs_uri: str | None = None,
+    exclude_join_keys: list[str] | None = None,
+    top_k: int | None = None,
+    log_neighbors: bool = True,
+    include_embed_text: bool = False,
+) -> dict[str, Any]:
+    """Extract embeddings + vector search only (no RAG coding model)."""
+    q_join_key, embed_txt = _primary_line_for_embed(extraction)
+    hits, rows, jks = _embed_and_retrieve_neighbors(
+        extraction, exclude_join_keys=exclude_join_keys, top_k=top_k
+    )
+    neighbors: list[dict[str, Any]] = []
+    for i, h in enumerate(hits, start=1):
+        tr = rows.get(h.join_key)
+        rec: dict[str, Any] = {
+            "rank": i,
+            "join_key": h.join_key,
+            "invoice_line_id": h.invoice_line_id,
+            "document_id": h.document_id,
+            "line_index": h.line_index,
+            "cosine_distance": h.distance,
+            "training": _training_snippet(tr) if tr else None,
+        }
+        neighbors.append(rec)
+        if log_neighbors:
+            if tr:
+                logger.info(
+                    "similar_neighbor rank=%d join_key=%s document_id=%s line_index=%d "
+                    "cosine_distance=%.6f supplier=%r invoice_number=%r account=%r",
+                    i,
+                    h.join_key,
+                    h.document_id,
+                    h.line_index,
+                    h.distance,
+                    tr.get("supplier"),
+                    tr.get("invoice_number"),
+                    tr.get("account"),
+                )
+            else:
+                logger.info(
+                    "similar_neighbor rank=%d join_key=%s invoice_line_id=%s document_id=%s "
+                    "line_index=%d cosine_distance=%.6f (no row in invoice_gl_training_view)",
+                    i,
+                    h.join_key,
+                    h.invoice_line_id,
+                    h.document_id,
+                    h.line_index,
+                    h.distance,
+                )
+
+    out: dict[str, Any] = {
+        "gcs_uri": gcs_uri,
+        "query": {
+            "document_id": extraction.document_id,
+            "join_key_used_for_retrieval": q_join_key,
+            "embed_text_preview": embed_txt[:240] + ("…" if len(embed_txt) > 240 else ""),
+            "supplier": extraction.supplier,
+            "invoice_number": extraction.invoice_number,
+            "currency": extraction.currency,
+        },
+        "neighbor_join_keys": jks,
+        "neighbors": neighbors,
+    }
+    if include_embed_text:
+        out["query"]["embed_text"] = embed_txt
+    return out
+
+
+def similar_invoices_for_gcs_pdf(
+    gcs_uri: str,
+    *,
+    exclude_join_keys: list[str] | None = None,
+    top_k: int | None = None,
+    log_neighbors: bool = True,
+    include_embed_text: bool = False,
+) -> dict[str, Any]:
+    ext = extract_invoice_online(gcs_uri=gcs_uri)
+    return similar_invoices_for_extraction(
+        ext,
+        gcs_uri=gcs_uri,
+        exclude_join_keys=exclude_join_keys,
+        top_k=top_k,
+        log_neighbors=log_neighbors,
+        include_embed_text=include_embed_text,
+    )
+
+
+def similar_invoices_for_local_pdf(
+    path: Path,
+    *,
+    exclude_join_keys: list[str] | None = None,
+    top_k: int | None = None,
+    log_neighbors: bool = True,
+    include_embed_text: bool = False,
+) -> dict[str, Any]:
+    ext = extract_invoice_online(local_pdf=path)
+    return similar_invoices_for_extraction(
+        ext,
+        gcs_uri=None,
+        exclude_join_keys=exclude_join_keys,
+        top_k=top_k,
+        log_neighbors=log_neighbors,
+        include_embed_text=include_embed_text,
+    )
+
+
+def suggest_coding_for_extraction(
+    extraction: InvoiceExtractionResult,
+    *,
+    exclude_join_keys: list[str] | None = None,
+    top_k: int | None = None,
+    persist: bool = True,
+    gcs_uri: str | None = None,
+) -> tuple[CodingSuggestion, list[NeighborHit], dict[str, Any]]:
+    hits, rows, jks = _embed_and_retrieve_neighbors(
+        extraction, exclude_join_keys=exclude_join_keys, top_k=top_k
+    )
     neighbor_rows = [rows[h.join_key] for h in hits if h.join_key in rows]
     block = neighbors_block_text(hits, rows)
     client = _genai_client()
