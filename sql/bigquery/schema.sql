@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.invoice_line_embeddings` (
   invoice_line_id STRING NOT NULL OPTIONS (description = 'join_key + line_index as STRING'),
   document_id STRING NOT NULL,
   line_index INT64 NOT NULL,
-  embedding ARRAY<FLOAT64> NOT NULL,
+  embedding ARRAY<FLOAT64>,
   embed_text STRING,
   embedding_model STRING,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
