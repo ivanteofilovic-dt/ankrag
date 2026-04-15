@@ -12,6 +12,10 @@ Historical files such as ``GL_202603.txt`` are tab-separated text with this head
 ``BOOKING_DATE`` uses English month abbreviations and 12-hour clock, e.g.
 ``Mar 31 2026 12:00 AM``. Exports are often Windows-1252 (Nordic); when decoding fails as
 UTF-8, :func:`iter_oracle_gl_rows` falls back to cp1252.
+
+``NET_ACCOUNTED`` may contain more than nine decimal places; BigQuery ``NUMERIC`` allows at
+most scale 9, so amounts are rounded half-up to nine fractional digits before load. The
+full precision remains in ``raw_source_row``.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import os
 import re
 import tempfile
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -103,6 +107,27 @@ def _parse_amount(s: str) -> Decimal | None:
         return None
 
 
+# BigQuery NUMERIC(38, 9): at most nine digits after the decimal point.
+_BQ_NUMERIC_QUANTUM = Decimal("0.000000001")
+
+
+def _format_amount_for_bigquery_csv(raw_net_accounted: str) -> str:
+    """
+    Return a CSV field loadable as BigQuery NUMERIC, or empty string for NULL.
+
+    Values with more than nine fractional digits are rounded half-up; scientific notation
+    is never emitted (``format(..., "f")``).
+    """
+    amount = _parse_amount(raw_net_accounted)
+    if amount is None:
+        return ""
+    try:
+        q = amount.quantize(_BQ_NUMERIC_QUANTUM, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        return ""
+    return format(q, "f")
+
+
 def _row_fingerprint(row: dict[str, str]) -> str:
     parts = [
         (row.get(k) or "").strip()
@@ -156,7 +181,6 @@ def oracle_gl_row_to_load_tuple(row: dict[str, str]) -> tuple:
     fp = _row_fingerprint(row)
     posting = _parse_booking_date(row.get("BOOKING_DATE", ""))
     p_start, p_end = _period_bounds(row.get("PERIOD", ""))
-    amount = _parse_amount(row.get("NET_ACCOUNTED", ""))
     desc = _description(row)
     raw = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
     return (
@@ -171,7 +195,7 @@ def oracle_gl_row_to_load_tuple(row: dict[str, str]) -> tuple:
         (row.get("PROJECT") or "").strip(),
         (row.get("SYSTEM") or "").strip(),
         (row.get("RESERVE") or "").strip(),
-        str(amount) if amount is not None else "",
+        _format_amount_for_bigquery_csv(row.get("NET_ACCOUNTED", "")),
         "",
         p_start.isoformat() if p_start else "",
         p_end.isoformat() if p_end else "",
