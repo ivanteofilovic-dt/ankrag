@@ -8,6 +8,10 @@ from google.cloud import bigquery
 from ankrag.config import require_settings
 from ankrag.embeddings.text import canonical_embed_text
 
+# Streaming insert (insertAll) should stay small: large JSON bodies often hit ~10MB limits
+# and are more likely to be cut off by proxies (SSLEOFError / EOF in violation of protocol).
+_EMBED_INSERT_BATCH = 100
+
 
 def _embedding_client() -> genai.Client:
     s = require_settings()
@@ -101,7 +105,9 @@ def backfill_embeddings_from_extractions(
                 "embedding_model": settings.embedding_model,
             }
         )
-    errors = client.insert_rows_json(table, out_rows)
-    if errors:
-        raise RuntimeError(f"embedding insert errors: {errors[:2]}")
+    for start in range(0, len(out_rows), _EMBED_INSERT_BATCH):
+        chunk = out_rows[start : start + _EMBED_INSERT_BATCH]
+        errors = client.insert_rows_json(table, chunk)
+        if errors:
+            raise RuntimeError(f"embedding insert errors (rows {start}-{start + len(chunk)}): {errors[:2]}")
     return len(out_rows)
