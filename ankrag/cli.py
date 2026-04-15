@@ -282,6 +282,22 @@ def cmd_suggest(
     typer.echo(json.dumps({"neighbors": len(hits), **meta}, default=str, indent=2))
 
 
+@app.command("serve")
+def cmd_serve(
+    host: str = typer.Option("127.0.0.1", help="Bind address"),
+    port: int = typer.Option(8000, help="Port"),
+    reload: bool = typer.Option(False, help="Dev auto-reload"),
+) -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "ankrag.api.main:app",
+        host=host,
+        port=port,
+        reload=reload,
+    )
+
+
 @app.command("eval-heldout")
 def cmd_eval_heldout(
     n: int = typer.Option(20),

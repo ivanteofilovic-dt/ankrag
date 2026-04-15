@@ -5,13 +5,16 @@ description = "AnkReg: historical RAG for invoice coding on GCP (BigQuery, Gemin
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.115.0",
     "google-cloud-aiplatform>=1.70.0",
     "google-cloud-bigquery>=3.25.0",
     "google-cloud-storage>=2.18.0",
     "google-genai>=1.0.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.6.0",
+    "python-multipart>=0.0.9",
     "typer>=0.15.0",
+    "uvicorn[standard]>=0.32.0",
 ]
 
 [project.scripts]

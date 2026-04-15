@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 GL_*.txt
+
+# Frontend
+frontend/node_modules/
+frontend/dist/

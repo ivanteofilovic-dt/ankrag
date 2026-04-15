@@ -19,7 +19,7 @@ from ankrag.embeddings.embed import embed_texts
 from ankrag.embeddings.text import canonical_embed_text
 from ankrag.extract.prompts import HISTORICAL_EXTRACTION_SYSTEM, RAG_SYSTEM, extraction_user_prompt, rag_user_prompt
 from ankrag.extract.schema import InvoiceExtractionResult
-from ankrag.rag.confidence import apply_confidence_policy
+from ankrag.rag.confidence import apply_confidence_policy, distance_to_similarity
 from ankrag.rag.context import fetch_training_rows_for_join_keys, neighbors_block_text
 from ankrag.rag.models import CodingSuggestion
 from ankrag.rag.retrieve import NeighborHit, retrieve_similar
@@ -117,7 +117,7 @@ def _embed_and_retrieve_neighbors(
     return hits, rows, jks
 
 
-def _training_snippet(row: dict[str, Any]) -> dict[str, Any]:
+def training_row_snippet(row: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "join_key",
         "document_id",
@@ -151,6 +151,26 @@ def _training_snippet(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def neighbor_records(hits: list[NeighborHit], rows: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Structured neighbor list for APIs / CLI (cosine distance + training snippet)."""
+    neighbors: list[dict[str, Any]] = []
+    for i, h in enumerate(hits, start=1):
+        tr = rows.get(h.join_key)
+        neighbors.append(
+            {
+                "rank": i,
+                "join_key": h.join_key,
+                "invoice_line_id": h.invoice_line_id,
+                "document_id": h.document_id,
+                "line_index": h.line_index,
+                "cosine_distance": h.distance,
+                "similarity": distance_to_similarity(h.distance),
+                "training": training_row_snippet(tr) if tr else None,
+            }
+        )
+    return neighbors
+
+
 def similar_invoices_for_extraction(
     extraction: InvoiceExtractionResult,
     *,
@@ -165,20 +185,10 @@ def similar_invoices_for_extraction(
     hits, rows, jks = _embed_and_retrieve_neighbors(
         extraction, exclude_join_keys=exclude_join_keys, top_k=top_k
     )
-    neighbors: list[dict[str, Any]] = []
-    for i, h in enumerate(hits, start=1):
-        tr = rows.get(h.join_key)
-        rec: dict[str, Any] = {
-            "rank": i,
-            "join_key": h.join_key,
-            "invoice_line_id": h.invoice_line_id,
-            "document_id": h.document_id,
-            "line_index": h.line_index,
-            "cosine_distance": h.distance,
-            "training": _training_snippet(tr) if tr else None,
-        }
-        neighbors.append(rec)
-        if log_neighbors:
+    neighbors = neighbor_records(hits, rows)
+    if log_neighbors:
+        for i, h in enumerate(hits, start=1):
+            tr = rows.get(h.join_key)
             if tr:
                 logger.info(
                     "similar_neighbor rank=%d join_key=%s document_id=%s line_index=%d "
