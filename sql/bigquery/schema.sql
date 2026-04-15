@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.gl_lines` (
   account STRING,
   cost_center STRING,
   product_code STRING,
+  ic STRING OPTIONS (description = 'Oracle IC coding dimension from GL export'),
+  project STRING OPTIONS (description = 'Oracle PROJECT coding dimension from GL export'),
+  gl_system STRING OPTIONS (description = 'Oracle SYSTEM column (reporting / system dimension); named gl_system to avoid SQL keyword SYSTEM'),
+  reserve STRING OPTIONS (description = 'Oracle RESERVE coding dimension from GL export'),
   amount NUMERIC,
   currency STRING,
   periodization_start DATE,
@@ -24,6 +28,12 @@ CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.gl_lines` (
 )
 PARTITION BY posting_date
 CLUSTER BY join_key, company_code;
+
+-- Add coding dimensions on existing datasets (no-op when columns already exist).
+ALTER TABLE `PROJECT.DATASET.gl_lines` ADD COLUMN IF NOT EXISTS ic STRING OPTIONS (description = 'Oracle IC coding dimension from GL export');
+ALTER TABLE `PROJECT.DATASET.gl_lines` ADD COLUMN IF NOT EXISTS project STRING OPTIONS (description = 'Oracle PROJECT coding dimension from GL export');
+ALTER TABLE `PROJECT.DATASET.gl_lines` ADD COLUMN IF NOT EXISTS gl_system STRING OPTIONS (description = 'Oracle SYSTEM column; gl_system avoids SQL keyword SYSTEM');
+ALTER TABLE `PROJECT.DATASET.gl_lines` ADD COLUMN IF NOT EXISTS reserve STRING OPTIONS (description = 'Oracle RESERVE coding dimension from GL export');
 
 CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.invoice_documents` (
   document_id STRING NOT NULL OPTIONS (description = 'Internal id; can match join_key prefix or hash'),
@@ -67,6 +77,10 @@ SELECT
   g.account,
   g.cost_center,
   g.product_code,
+  g.ic,
+  g.project,
+  g.gl_system,
+  g.reserve,
   g.amount AS gl_amount,
   g.currency AS gl_currency,
   g.periodization_start,

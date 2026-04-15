@@ -11,6 +11,10 @@ class JournalLine(BaseModel):
     account: str | None = None
     cost_center: str | None = None
     product_code: str | None = None
+    ic: str | None = None
+    project: str | None = None
+    gl_system: str | None = None
+    reserve: str | None = None
     debit: str | None = None
     credit: str | None = None
     currency: str | None = None

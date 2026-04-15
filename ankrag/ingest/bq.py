@@ -97,7 +97,8 @@ def load_gl_csv_to_bigquery(
     Tab-separated Oracle / subledger exports (``GL_YYYYMM.txt``) are not loaded here; use
     ``ankrag.ingest.gl_oracle.load_oracle_gl_tsv_to_bigquery`` or ``ankrag load-gl --oracle-export``.
 
-    For production, prefer an explicit schema JSON (see ``sql/bigquery/gl_load_schema.json``).
+    For production, prefer an explicit schema JSON (see ``sql/bigquery/gl_load_schema.json``),
+    including ``ic``, ``project``, ``gl_system``, ``reserve`` when using the full ``gl_lines`` shape.
     """
     settings = require_settings()
     client = bigquery.Client(project=settings.gcp_project, location=settings.bq_location)

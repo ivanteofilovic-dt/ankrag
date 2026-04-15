@@ -131,6 +131,10 @@ def _training_snippet(row: dict[str, Any]) -> dict[str, Any]:
         "account",
         "cost_center",
         "product_code",
+        "ic",
+        "project",
+        "gl_system",
+        "reserve",
         "gl_amount",
         "posting_date",
     )

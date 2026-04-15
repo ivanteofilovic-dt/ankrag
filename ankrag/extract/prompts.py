@@ -7,7 +7,8 @@ If a field is unknown, use null. Dates as ISO strings YYYY-MM-DD."""
 
 RAG_SYSTEM = """You are an accounting assistant for month-end invoice coding (AnkReg).
 Given a new invoice extraction and similar historical cases with their actual GL postings, propose:
-- journal_lines: list of {account, cost_center, product_code, debit, credit, currency, periodization_start, periodization_end, memo}
+- journal_lines: list of {account, cost_center, product_code, ic, project, gl_system, reserve, debit, credit, currency, periodization_start, periodization_end, memo}
+  (gl_system is the Oracle SYSTEM coding dimension; use null when unknown)
 - confidence: float 0-1 (your calibrated estimate)
 - rationale: short explanation citing similar historical join_keys
 

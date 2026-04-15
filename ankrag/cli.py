@@ -56,7 +56,7 @@ def cmd_upload_file(
 def cmd_load_gl(
     source: str = typer.Argument(
         ...,
-        help="Comma CSV: gs://bucket/path.csv (or wildcard). Tab GL export: use --oracle-export with local path or gs://.../GL_YYYYMM.txt",
+        help="CSV: gs://bucket/path.csv (or wildcard). Oracle: file, directory of GL_*.txt, or gs://.../GL_YYYYMM.txt with --oracle-export",
     ),
     oracle_export: bool = typer.Option(
         False,
@@ -66,6 +66,21 @@ def cmd_load_gl(
     autodetect: bool = typer.Option(
         False,
         help="Let BigQuery infer CSV schema (not recommended for production); ignored with --oracle-export",
+    ),
+    encoding: str | None = typer.Option(
+        None,
+        "--encoding",
+        help="Text encoding for --oracle-export (default: UTF-8, else Windows-1252)",
+    ),
+    gl_glob: str = typer.Option(
+        "GL_*.txt",
+        "--gl-glob",
+        help="With --oracle-export and a directory: basename glob (e.g. GL_*.txt)",
+    ),
+    recursive: bool = typer.Option(
+        False,
+        "--recursive",
+        help="With --oracle-export and a directory: match GL files in subfolders too",
     ),
 ) -> None:
     from pathlib import Path
@@ -77,7 +92,13 @@ def cmd_load_gl(
     if oracle_export:
         p = Path(source)
         loc: Path | str = source if source.startswith("gs://") else p
-        table = load_oracle_gl_tsv_to_bigquery(loc, schema_file=schema if schema.exists() else None)
+        table = load_oracle_gl_tsv_to_bigquery(
+            loc,
+            schema_file=schema if schema.exists() else None,
+            encoding=encoding,
+            directory_glob=gl_glob,
+            recursive=recursive,
+        )
     else:
         table = load_gl_csv_to_bigquery(
             source,
