@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class JournalLine(BaseModel):
@@ -17,6 +17,20 @@ class JournalLine(BaseModel):
     reserve: str | None = None
     debit: str | None = None
     credit: str | None = None
+
+    @field_validator("debit", "credit", mode="before")
+    @classmethod
+    def _coerce_amount_to_str(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        # bool subclasses int; reject accidental booleans before numeric coercion.
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, (int, float)):
+            return str(v)
+        if isinstance(v, str):
+            return v
+        return str(v)
     currency: str | None = None
     periodization_start: str | None = None
     periodization_end: str | None = None
