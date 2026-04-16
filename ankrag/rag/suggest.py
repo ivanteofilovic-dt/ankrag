@@ -14,13 +14,17 @@ logger = logging.getLogger(__name__)
 from google import genai
 from google.genai import types
 
-from ankrag.config import require_settings
+from ankrag.config import get_settings, require_settings
 from ankrag.embeddings.embed import embed_texts
 from ankrag.embeddings.text import canonical_embed_text
 from ankrag.extract.prompts import HISTORICAL_EXTRACTION_SYSTEM, RAG_SYSTEM, extraction_user_prompt, rag_user_prompt
 from ankrag.extract.schema import InvoiceExtractionResult
-from ankrag.rag.confidence import apply_confidence_policy, distance_to_similarity
-from ankrag.rag.context import fetch_training_rows_for_join_keys, neighbors_block_text
+from ankrag.rag.confidence import (
+    apply_confidence_policy,
+    distance_to_similarity,
+    sum_confidence_by_coding,
+)
+from ankrag.rag.context import fetch_training_rows_for_join_keys, neighbors_block_text_per_line
 from ankrag.rag.models import CodingSuggestion
 from ankrag.rag.retrieve import NeighborHit, retrieve_similar
 
@@ -72,21 +76,29 @@ def extract_invoice_online(*, gcs_uri: str | None = None, local_pdf: Path | None
     return InvoiceExtractionResult.from_model_dict(data)
 
 
-def _primary_line_for_embed(extraction: InvoiceExtractionResult) -> tuple[str, str]:
-    """Returns (join_key, embed_text)."""
+def _clamp_neighbors_per_line(k: int | None) -> int:
+    settings = get_settings()
+    n = int(k if k is not None else settings.rag_neighbors_per_line)
+    return max(3, min(5, n))
+
+
+def _line_embed_specs(extraction: InvoiceExtractionResult) -> list[tuple[int, str, str]]:
+    """(line_index, join_key, embed_text) for each extraction line, sorted by line_index."""
     if extraction.lines:
-        line = extraction.lines[0]
-        jk = line.join_key
-        t = canonical_embed_text(
-            supplier=extraction.supplier,
-            invoice_number=extraction.invoice_number,
-            line_description=line.description,
-            line_amount=line.amount,
-            currency=extraction.currency,
-            periodization_hint=extraction.periodization_hint,
-            join_key=jk,
-        )
-        return jk, t
+        lines = sorted(extraction.lines, key=lambda li: li.line_index)
+        out: list[tuple[int, str, str]] = []
+        for line in lines:
+            t = canonical_embed_text(
+                supplier=extraction.supplier,
+                invoice_number=extraction.invoice_number,
+                line_description=line.description,
+                line_amount=line.amount,
+                currency=extraction.currency,
+                periodization_hint=extraction.periodization_hint,
+                join_key=line.join_key,
+            )
+            out.append((line.line_index, line.join_key, t))
+        return out
     jk = extraction.document_id
     t = canonical_embed_text(
         supplier=extraction.supplier,
@@ -97,24 +109,47 @@ def _primary_line_for_embed(extraction: InvoiceExtractionResult) -> tuple[str, s
         periodization_hint=extraction.periodization_hint,
         join_key=jk,
     )
-    return jk, t
+    return [(0, jk, t)]
 
 
-def _embed_and_retrieve_neighbors(
+def _tag_hits(hits: list[NeighborHit], query_line_index: int) -> list[NeighborHit]:
+    return [
+        NeighborHit(
+            join_key=h.join_key,
+            invoice_line_id=h.invoice_line_id,
+            document_id=h.document_id,
+            line_index=h.line_index,
+            distance=h.distance,
+            query_line_index=query_line_index,
+        )
+        for h in hits
+    ]
+
+
+def _embed_and_retrieve_neighbors_per_line(
     extraction: InvoiceExtractionResult,
     *,
     exclude_join_keys: list[str] | None = None,
-    top_k: int | None = None,
-) -> tuple[list[NeighborHit], dict[str, dict[str, Any]], list[str]]:
-    settings = require_settings()
-    k = top_k or settings.rag_top_k
-    _, embed_txt = _primary_line_for_embed(extraction)
-    qvec = embed_texts([embed_txt])[0]
+    neighbors_per_line: int | None = None,
+) -> tuple[list[NeighborHit], list[tuple[int, list[NeighborHit]]], dict[str, dict[str, Any]], list[str]]:
+    k = _clamp_neighbors_per_line(neighbors_per_line)
+    specs = _line_embed_specs(extraction)
+    texts = [t for _, _, t in specs]
+    vectors = embed_texts(texts)
     excl = list(exclude_join_keys or [])
-    hits = retrieve_similar(qvec, top_k=k, exclude_join_keys=excl if excl else None)
-    jks = list({h.join_key for h in hits})
+    excl_param = excl if excl else None
+
+    line_hits: list[tuple[int, list[NeighborHit]]] = []
+    flat: list[NeighborHit] = []
+    for (line_idx, _jk, _t), qvec in zip(specs, vectors, strict=True):
+        raw = retrieve_similar(qvec, top_k=k, exclude_join_keys=excl_param)
+        tagged = _tag_hits(raw, line_idx)
+        line_hits.append((line_idx, tagged))
+        flat.extend(tagged)
+
+    jks = list({h.join_key for h in flat})
     rows = fetch_training_rows_for_join_keys(jks)
-    return hits, rows, jks
+    return flat, line_hits, rows, jks
 
 
 def training_row_snippet(row: dict[str, Any]) -> dict[str, Any]:
@@ -156,18 +191,19 @@ def neighbor_records(hits: list[NeighborHit], rows: dict[str, dict[str, Any]]) -
     neighbors: list[dict[str, Any]] = []
     for i, h in enumerate(hits, start=1):
         tr = rows.get(h.join_key)
-        neighbors.append(
-            {
-                "rank": i,
-                "join_key": h.join_key,
-                "invoice_line_id": h.invoice_line_id,
-                "document_id": h.document_id,
-                "line_index": h.line_index,
-                "cosine_distance": h.distance,
-                "similarity": distance_to_similarity(h.distance),
-                "training": training_row_snippet(tr) if tr else None,
-            }
-        )
+        rec: dict[str, Any] = {
+            "rank": i,
+            "join_key": h.join_key,
+            "invoice_line_id": h.invoice_line_id,
+            "document_id": h.document_id,
+            "line_index": h.line_index,
+            "cosine_distance": h.distance,
+            "similarity": distance_to_similarity(h.distance),
+            "training": training_row_snippet(tr) if tr else None,
+        }
+        if h.query_line_index is not None:
+            rec["query_line_index"] = h.query_line_index
+        neighbors.append(rec)
     return neighbors
 
 
@@ -181,54 +217,68 @@ def similar_invoices_for_extraction(
     include_embed_text: bool = False,
 ) -> dict[str, Any]:
     """Extract embeddings + vector search only (no RAG coding model)."""
-    q_join_key, embed_txt = _primary_line_for_embed(extraction)
-    hits, rows, jks = _embed_and_retrieve_neighbors(
-        extraction, exclude_join_keys=exclude_join_keys, top_k=top_k
+    k = _clamp_neighbors_per_line(top_k)
+    hits, line_hits, rows, jks = _embed_and_retrieve_neighbors_per_line(
+        extraction, exclude_join_keys=exclude_join_keys, neighbors_per_line=k
     )
-    neighbors = neighbor_records(hits, rows)
-    if log_neighbors:
-        for i, h in enumerate(hits, start=1):
-            tr = rows.get(h.join_key)
-            if tr:
-                logger.info(
-                    "similar_neighbor rank=%d join_key=%s document_id=%s line_index=%d "
-                    "cosine_distance=%.6f supplier=%r invoice_number=%r account=%r",
-                    i,
-                    h.join_key,
-                    h.document_id,
-                    h.line_index,
-                    h.distance,
-                    tr.get("supplier"),
-                    tr.get("invoice_number"),
-                    tr.get("account"),
-                )
-            else:
-                logger.info(
-                    "similar_neighbor rank=%d join_key=%s invoice_line_id=%s document_id=%s "
-                    "line_index=%d cosine_distance=%.6f (no row in invoice_gl_training_view)",
-                    i,
-                    h.join_key,
-                    h.invoice_line_id,
-                    h.document_id,
-                    h.line_index,
-                    h.distance,
-                )
+    specs = _line_embed_specs(extraction)
+    line_payload: list[dict[str, Any]] = []
+    for (line_idx, _jk, embed_txt), (_li, lh) in zip(specs, line_hits, strict=True):
+        if line_idx != _li:
+            raise RuntimeError("per-line retrieval alignment bug")
+        neighbors = neighbor_records(lh, rows)
+        block: dict[str, Any] = {
+            "line_index": line_idx,
+            "neighbors_per_line": k,
+            "neighbors": neighbors,
+            "embed_text_preview": embed_txt[:240] + ("…" if len(embed_txt) > 240 else ""),
+        }
+        if include_embed_text:
+            block["embed_text"] = embed_txt
+        line_payload.append(block)
+        if log_neighbors:
+            for i, h in enumerate(lh, start=1):
+                tr = rows.get(h.join_key)
+                if tr:
+                    logger.info(
+                        "similar_neighbor query_line=%d rank=%d join_key=%s document_id=%s line_index=%d "
+                        "cosine_distance=%.6f supplier=%r invoice_number=%r account=%r",
+                        line_idx,
+                        i,
+                        h.join_key,
+                        h.document_id,
+                        h.line_index,
+                        h.distance,
+                        tr.get("supplier"),
+                        tr.get("invoice_number"),
+                        tr.get("account"),
+                    )
+                else:
+                    logger.info(
+                        "similar_neighbor query_line=%d rank=%d join_key=%s invoice_line_id=%s document_id=%s "
+                        "line_index=%d cosine_distance=%.6f (no row in invoice_gl_training_view)",
+                        line_idx,
+                        i,
+                        h.join_key,
+                        h.invoice_line_id,
+                        h.document_id,
+                        h.line_index,
+                        h.distance,
+                    )
 
     out: dict[str, Any] = {
         "gcs_uri": gcs_uri,
         "query": {
             "document_id": extraction.document_id,
-            "join_key_used_for_retrieval": q_join_key,
-            "embed_text_preview": embed_txt[:240] + ("…" if len(embed_txt) > 240 else ""),
             "supplier": extraction.supplier,
             "invoice_number": extraction.invoice_number,
             "currency": extraction.currency,
+            "neighbors_per_line": k,
         },
+        "lines": line_payload,
         "neighbor_join_keys": jks,
-        "neighbors": neighbors,
+        "neighbors": neighbor_records(hits, rows),
     }
-    if include_embed_text:
-        out["query"]["embed_text"] = embed_txt
     return out
 
 
@@ -278,11 +328,13 @@ def suggest_coding_for_extraction(
     persist: bool = True,
     gcs_uri: str | None = None,
 ) -> tuple[CodingSuggestion, list[NeighborHit], dict[str, Any]]:
-    hits, rows, jks = _embed_and_retrieve_neighbors(
-        extraction, exclude_join_keys=exclude_join_keys, top_k=top_k
+    k = _clamp_neighbors_per_line(top_k)
+    hits, line_hits, rows, jks = _embed_and_retrieve_neighbors_per_line(
+        extraction, exclude_join_keys=exclude_join_keys, neighbors_per_line=k
     )
-    neighbor_rows = [rows[h.join_key] for h in hits if h.join_key in rows]
-    block = neighbors_block_text(hits, rows)
+    ordered = sorted(hits, key=lambda h: h.distance)
+    neighbor_rows = [rows[h.join_key] for h in ordered if h.join_key in rows]
+    block = neighbors_block_text_per_line(line_hits, rows)
     client = _genai_client()
     model = _gemini_model_id()
     user = rag_user_prompt(
@@ -303,8 +355,11 @@ def suggest_coding_for_extraction(
         raise RuntimeError("Empty RAG response")
     raw = json.loads(resp.text)
     suggestion = CodingSuggestion.from_model_json(raw)
-    suggestion, final_conf, meta = apply_confidence_policy(suggestion, hits, neighbor_rows)
+    suggestion, final_conf, meta = apply_confidence_policy(suggestion, ordered, neighbor_rows)
     meta["neighbor_join_keys"] = jks
+    meta["neighbors_per_line"] = k
+    if suggestion.line_predictions:
+        meta["coding_confidence_sums"] = sum_confidence_by_coding(suggestion.line_predictions)
 
     if persist:
         _persist_suggestion(

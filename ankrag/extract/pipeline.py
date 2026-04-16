@@ -28,20 +28,32 @@ def import_batch_prediction_jsonl(
     model_id: str,
     gcs_by_key: dict[str, str] | None = None,
     register_documents: bool = True,
+    limit: int | None = None,
+    join_key_source: str = "invoice_number",
 ) -> tuple[int, int]:
     """
     Parse one Vertex batch output JSONL file; insert invoice_extractions (+ optional invoice_documents).
 
     gcs_by_key maps batch `key` -> gs:// URI for error logging and invoice_documents.
+    ``limit`` caps successful imports (skipped rows do not count). ``join_key_source``
+    ``invoice_number`` sets ``join_key`` from trimmed ``invoice_number`` (fallback ``document_id``).
     Returns (success_count, error_count).
     """
     ok, err = 0, 0
     for row in iter_batch_jsonl(path):
+        if limit is not None and ok >= limit:
+            break
         key = str(row.get("key", ""))
         gcs_uri = (gcs_by_key or {}).get(key)
         try:
             _, result = parse_batch_line(row)
-            insert_extractions(extraction_to_rows(result, model_id=model_id))
+            insert_extractions(
+                extraction_to_rows(
+                    result,
+                    model_id=model_id,
+                    join_key_source=join_key_source,
+                )
+            )
             if register_documents and gcs_uri:
                 import_invoice_documents(
                     [

@@ -37,10 +37,22 @@ class JournalLine(BaseModel):
     memo: str | None = None
 
 
+class LineCodingPrediction(BaseModel):
+    """One proposed GL coding for a single line on the new invoice."""
+
+    line_index: int = Field(ge=0)
+    journal_line: JournalLine
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
 class CodingSuggestion(BaseModel):
     journal_lines: list[JournalLine] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
     rationale: str = ""
+    line_predictions: list[LineCodingPrediction] = Field(
+        default_factory=list,
+        description="Per extraction line: predicted coding + confidence (used to aggregate by coding).",
+    )
 
     @classmethod
     def from_model_json(cls, data: dict[str, Any]) -> CodingSuggestion:

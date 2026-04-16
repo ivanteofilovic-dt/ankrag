@@ -11,7 +11,7 @@ class InvoiceLineItem(BaseModel):
     line_index: int = Field(ge=0)
     description: str | None = None
     amount: str | None = None
-    join_key: str = Field(description="Must match GL join_key for this line")
+    join_key: str = Field(description="Invoice number / GL INVOICE_NUM (trimmed); must match gl_lines.join_key")
 
 
 class InvoiceExtractionResult(BaseModel):

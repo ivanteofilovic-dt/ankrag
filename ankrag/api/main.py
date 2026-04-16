@@ -82,6 +82,7 @@ def public_config() -> dict[str, Any]:
         "gemini_model": s.gemini_model,
         "embedding_model": s.embedding_model,
         "rag_top_k": s.rag_top_k,
+        "rag_neighbors_per_line": s.rag_neighbors_per_line,
         "confidence_high_threshold": s.confidence_high_threshold,
         "confidence_low_threshold": s.confidence_low_threshold,
         "vector_search_backend": "matching_engine"
@@ -284,7 +285,12 @@ async def analyze_pdf(
 @app.post("/api/similar")
 async def similar_pdf(
     file: UploadFile = File(...),
-    top_k: int | None = Query(None, ge=1, le=50),
+    top_k: int | None = Query(
+        None,
+        ge=1,
+        le=50,
+        description="Neighbors retrieved per invoice line (values are clamped to 3–5).",
+    ),
 ) -> dict[str, Any]:
     try:
         require_settings()

@@ -35,6 +35,18 @@ def fetch_training_rows_for_join_keys(join_keys: list[str]) -> dict[str, dict[st
     return out
 
 
+def neighbors_block_text_per_line(
+    line_hits: list[tuple[int, list[Any]]],
+    rows_by_jk: dict[str, dict[str, Any]],
+) -> str:
+    """Group retrieval context by query invoice line_index (each group is 3–5 neighbors)."""
+    parts: list[str] = []
+    for line_idx, hits in line_hits:
+        parts.append(f"### NEW_INVOICE_LINE line_index={line_idx}")
+        parts.append(neighbors_block_text(hits, rows_by_jk))
+    return "\n".join(parts)
+
+
 def neighbors_block_text(
     hits: list[Any],
     rows_by_jk: dict[str, dict[str, Any]],

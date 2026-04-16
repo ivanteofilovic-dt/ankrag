@@ -30,14 +30,32 @@ def _parse_date(s: str | None) -> str | None:
         return None
 
 
-def extraction_to_rows(result: InvoiceExtractionResult, *, model_id: str) -> list[dict[str, Any]]:
+def _invoice_join_key_from_extraction(invoice_number: str | None, document_id: str) -> str:
+    """Align with GL load when ``join_key_mode=invoice`` (trimmed invoice #)."""
+    s = (invoice_number or "").strip()
+    return s if s else document_id
+
+
+def extraction_to_rows(
+    result: InvoiceExtractionResult,
+    *,
+    model_id: str,
+    join_key_source: str = "invoice_number",
+) -> list[dict[str, Any]]:
+    if join_key_source not in ("invoice_number", "model"):
+        raise ValueError("join_key_source must be 'invoice_number' or 'model'")
     raw = result.model_dump()
     base_json = json.dumps(raw, ensure_ascii=False)
     rows: list[dict[str, Any]] = []
+    jk_invoice = (
+        _invoice_join_key_from_extraction(result.invoice_number, result.document_id)
+        if join_key_source == "invoice_number"
+        else None
+    )
     if not result.lines:
         rows.append(
             {
-                "join_key": result.document_id,
+                "join_key": jk_invoice if join_key_source == "invoice_number" else result.document_id,
                 "document_id": result.document_id,
                 "line_index": 0,
                 "supplier": result.supplier,
@@ -54,9 +72,10 @@ def extraction_to_rows(result: InvoiceExtractionResult, *, model_id: str) -> lis
         return rows
 
     for line in result.lines:
+        jk = jk_invoice if join_key_source == "invoice_number" else line.join_key
         rows.append(
             {
-                "join_key": line.join_key,
+                "join_key": jk,
                 "document_id": result.document_id,
                 "line_index": line.line_index,
                 "supplier": result.supplier,

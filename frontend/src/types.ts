@@ -11,6 +11,7 @@ export interface ConfigResponse {
   gemini_model: string;
   embedding_model: string;
   rag_top_k: number;
+  rag_neighbors_per_line: number;
   confidence_high_threshold: number;
   confidence_low_threshold: number;
   vector_search_backend: string;
@@ -55,10 +56,17 @@ export interface JournalLine {
   memo?: string | null;
 }
 
+export interface LineCodingPrediction {
+  line_index: number;
+  journal_line: JournalLine;
+  confidence: number;
+}
+
 export interface CodingSuggestion {
   journal_lines: JournalLine[];
   confidence: number;
   rationale: string;
+  line_predictions?: LineCodingPrediction[];
 }
 
 export interface TrainingSnippet {
@@ -84,6 +92,8 @@ export interface NeighborRecord {
   cosine_distance: number | null;
   similarity: number | null;
   training: TrainingSnippet | null;
+  /** Query invoice line this neighbor was retrieved for (per-line embedding search). */
+  query_line_index?: number | null;
 }
 
 export interface AnalyzeResponse {

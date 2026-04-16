@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     confidence_low_threshold: float = 0.5
 
     rag_top_k: int = 8
+    # Per extraction line: number of nearest historical lines (clamped to [3, 5] at use sites).
+    rag_neighbors_per_line: int = 5
 
     @property
     def publisher_gemini_resource(self) -> str:

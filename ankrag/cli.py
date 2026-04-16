@@ -82,6 +82,31 @@ def cmd_load_gl(
         "--recursive",
         help="With --oracle-export and a directory: match GL files in subfolders too",
     ),
+    gl_limit_rows: int | None = typer.Option(
+        None,
+        "--limit-rows",
+        help="With --oracle-export: max matching subledger detail rows to read after filters (subset / smoke test)",
+    ),
+    gl_join_key_mode: str = typer.Option(
+        "invoice",
+        "--join-key-mode",
+        help="With --oracle-export: invoice | entity_invoice | fingerprint (invoice ↔ extracted invoice_number)",
+    ),
+    gl_include_non_supplier: bool = typer.Option(
+        False,
+        "--include-non-supplier-rows",
+        help="With --oracle-export: also load rows without supplier number/name + invoice (default: supplier AP rows only)",
+    ),
+    gl_null_coding_ankreg: bool = typer.Option(
+        True,
+        "--null-coding-ankreg/--keep-coding-ankreg",
+        help="With --oracle-export: clear account/cost_center/product/ic/project/gl_system/reserve when GL_LINE_DESCRIPTION contains 'ankreg'",
+    ),
+    gl_per_source_line: bool = typer.Option(
+        False,
+        "--gl-per-source-line",
+        help="With --oracle-export: one gl_lines row per subledger line (default: roll up to one row per join key / invoice)",
+    ),
 ) -> None:
     from pathlib import Path
 
@@ -98,6 +123,11 @@ def cmd_load_gl(
             encoding=encoding,
             directory_glob=gl_glob,
             recursive=recursive,
+            max_rows=gl_limit_rows,
+            join_key_mode=gl_join_key_mode,
+            supplier_rows_only=not gl_include_non_supplier,
+            null_coding_when_ankreg=gl_null_coding_ankreg,
+            aggregate_by_invoice=not gl_per_source_line,
         )
     else:
         table = load_gl_csv_to_bigquery(
@@ -120,6 +150,11 @@ def cmd_build_batch_jsonl(
         "--prefix",
         help="GCS prefix listing PDFs",
     ),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        help="Only include the first N PDFs (sorted by object name) for a small batch",
+    ),
 ) -> None:
     from google.cloud import storage
 
@@ -137,6 +172,9 @@ def cmd_build_batch_jsonl(
         doc_id = Path(blob.name).stem
         bk = doc_id
         items.append((bk, uri, doc_id))
+    items.sort(key=lambda t: t[1])
+    if limit is not None:
+        items = items[:limit]
     if not items:
         raise typer.BadParameter(f"No PDFs under gs://{s.gcs_bucket}/{prefix}")
     write_local_jsonl(build_batch_jsonl_for_pdfs(items), jsonl_out)
@@ -174,6 +212,16 @@ def cmd_import_batch_results(
         help="batch_manifest.jsonl from build-batch-jsonl",
     ),
     model_id: str = typer.Option("", help="Defaults to GEMINI_BATCH_MODEL from env"),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        help="Stop after this many successfully imported batch lines (subset / smoke test)",
+    ),
+    join_key_source: str = typer.Option(
+        "invoice_number",
+        "--join-key-source",
+        help="invoice_number (match GL --join-key-mode invoice) | model (use JSON join_key per line)",
+    ),
 ) -> None:
     from ankrag.config import get_settings
     from ankrag.extract.pipeline import import_batch_prediction_jsonl, read_manifest
@@ -181,10 +229,21 @@ def cmd_import_batch_results(
     mid = model_id or get_settings().gemini_batch_model
     gcs_map = read_manifest(manifest) if manifest else None
     total_ok = total_err = 0
+    remaining = limit
     for p in jsonl_files:
-        ok, err = import_batch_prediction_jsonl(p, model_id=mid, gcs_by_key=gcs_map)
+        if remaining is not None and remaining <= 0:
+            break
+        ok, err = import_batch_prediction_jsonl(
+            p,
+            model_id=mid,
+            gcs_by_key=gcs_map,
+            limit=remaining,
+            join_key_source=join_key_source,
+        )
         total_ok += ok
         total_err += err
+        if remaining is not None:
+            remaining -= ok
         typer.echo(f"{p}: ok={ok} err={err}")
     typer.echo(f"TOTAL ok={total_ok} err={total_err}")
 
@@ -232,7 +291,10 @@ def cmd_export_vector_jsonl(
 def cmd_similar(
     gcs_uri: str | None = typer.Option(None, help="gs://.../invoice.pdf"),
     local_pdf: Path | None = typer.Option(None, exists=True, dir_okay=False),
-    top_k: int | None = typer.Option(None, help="Override RAG_TOP_K / settings.rag_top_k"),
+    top_k: int | None = typer.Option(
+        None,
+        help="Neighbors per invoice line (clamped to 3–5; default RAG_NEIGHBORS_PER_LINE)",
+    ),
     quiet: bool = typer.Option(False, help="JSON on stdout only; skip neighbor INFO lines on stderr"),
     include_embed_text: bool = typer.Option(False, help="Include full retrieval embed_text in JSON (can be long)"),
 ) -> None:
@@ -268,16 +330,20 @@ def cmd_suggest(
     gcs_uri: str | None = typer.Option(None, help="gs://.../invoice.pdf"),
     local_pdf: Path | None = typer.Option(None, exists=True, dir_okay=False),
     no_persist: bool = typer.Option(False),
+    top_k: int | None = typer.Option(
+        None,
+        help="Neighbors per invoice line for retrieval (clamped to 3–5)",
+    ),
 ) -> None:
     from ankrag.rag.suggest import suggest_coding_for_gcs_pdf, suggest_coding_for_local_pdf
 
     if bool(gcs_uri) == bool(local_pdf):
         raise typer.BadParameter("Provide exactly one of --gcs-uri or --local-pdf")
     if gcs_uri:
-        sug, hits, meta = suggest_coding_for_gcs_pdf(gcs_uri, persist=not no_persist)
+        sug, hits, meta = suggest_coding_for_gcs_pdf(gcs_uri, persist=not no_persist, top_k=top_k)
     else:
         assert local_pdf is not None
-        sug, hits, meta = suggest_coding_for_local_pdf(local_pdf, persist=not no_persist)
+        sug, hits, meta = suggest_coding_for_local_pdf(local_pdf, persist=not no_persist, top_k=top_k)
     typer.echo(sug.model_dump_json(indent=2))
     typer.echo(json.dumps({"neighbors": len(hits), **meta}, default=str, indent=2))
 

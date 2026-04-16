@@ -5,9 +5,11 @@
 CREATE SCHEMA IF NOT EXISTS `PROJECT.DATASET`
 OPTIONS (location = 'EU');
 
--- Historical GL lines — must include join_key aligning with invoice_extractions.
+-- Historical GL / subledger data — join_key aligns with invoice_extractions (default: trimmed
+-- INVOICE_NUM, same as extracted invoice_number). Oracle loads roll up to one row per join key
+-- unless ``--gl-per-source-line`` is used (see ``ankrag.ingest.gl_oracle``).
 CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.gl_lines` (
-  join_key STRING NOT NULL OPTIONS (description = 'Stable key linking invoice line to GL; Oracle GL_*.txt loads use ankrag.ingest.gl_oracle.compute_join_key'),
+  join_key STRING NOT NULL OPTIONS (description = 'Link to invoice_extractions; Oracle loads default to trimmed INVOICE_NUM (see ankrag.ingest.gl_oracle.compute_join_key, --join-key-mode, rollup)'),
   gl_line_id STRING OPTIONS (description = 'Optional surrogate from source system'),
   posting_date DATE,
   company_code STRING,
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.invoice_documents` (
 );
 
 -- One row per invoice line (or whole-invoice with line_index=0).
+-- join_key defaults to trimmed invoice_number on import when using invoice_number join (matches gl_lines).
 CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.invoice_extractions` (
   join_key STRING NOT NULL,
   document_id STRING NOT NULL,
@@ -61,7 +64,8 @@ CREATE TABLE IF NOT EXISTS `PROJECT.DATASET.invoice_extractions` (
 )
 CLUSTER BY join_key, document_id;
 
--- Denormalized view for training / RAG context.
+-- Denormalized view for training / RAG context (join_key = invoice number by default; at most
+-- one rolled-up GL row per key unless legacy per-line GL loads duplicated keys).
 CREATE OR REPLACE VIEW `PROJECT.DATASET.invoice_gl_training_view` AS
 SELECT
   e.join_key,

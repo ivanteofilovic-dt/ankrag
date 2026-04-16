@@ -16,6 +16,8 @@ class NeighborHit:
     document_id: str
     line_index: int
     distance: float
+    # When set, retrieval was anchored on this line_index of the query invoice.
+    query_line_index: int | None = None
 
 
 def retrieve_similar_bigquery(

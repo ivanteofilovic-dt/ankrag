@@ -1,4 +1,4 @@
-from ankrag.rag.models import CodingSuggestion, JournalLine
+from ankrag.rag.models import CodingSuggestion, JournalLine, LineCodingPrediction
 from ankrag.rag.retrieve import NeighborHit, retrieve_similar
 from ankrag.rag.suggest import (
     similar_invoices_for_extraction,
@@ -10,6 +10,7 @@ from ankrag.rag.suggest import (
 
 __all__ = [
     "JournalLine",
+    "LineCodingPrediction",
     "CodingSuggestion",
     "NeighborHit",
     "retrieve_similar",

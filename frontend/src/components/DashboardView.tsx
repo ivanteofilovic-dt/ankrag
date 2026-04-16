@@ -187,8 +187,9 @@ export function DashboardView() {
 
       <div className="flex items-center gap-2 text-sm text-slate-500">
         <Clock size={16} />
-        BigQuery dataset: <span className="font-mono text-slate-700">{config?.bq_dataset ?? "—"}</span> · top_k:{" "}
-        {config?.rag_top_k ?? "—"}
+        BigQuery dataset: <span className="font-mono text-slate-700">{config?.bq_dataset ?? "—"}</span> ·
+        neighbors/line:{" "}
+        {config?.rag_neighbors_per_line ?? config?.rag_top_k ?? "—"}
       </div>
     </div>
   );

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any
 
-from ankrag.rag.models import CodingSuggestion
+from ankrag.rag.models import CodingSuggestion, JournalLine, LineCodingPrediction
 from ankrag.rag.retrieve import NeighborHit
 
 
@@ -13,6 +14,28 @@ def distance_to_similarity(distance: float) -> float:
     # Cosine distance in [0, 2] typically; clamp similarity estimate.
     sim = max(0.0, 1.0 - float(distance))
     return min(1.0, sim)
+
+
+def coding_fingerprint(jl: JournalLine) -> str:
+    """Stable key for GL coding dimensions (amounts/memo excluded)."""
+    keys = (
+        "account",
+        "cost_center",
+        "product_code",
+        "ic",
+        "project",
+        "gl_system",
+        "reserve",
+    )
+    return "|".join(f"{k}={getattr(jl, k, None) or ''}" for k in keys)
+
+
+def sum_confidence_by_coding(line_predictions: list[LineCodingPrediction]) -> dict[str, float]:
+    """Sum model-reported line confidences for each distinct coding fingerprint."""
+    sums: dict[str, float] = defaultdict(float)
+    for lp in line_predictions:
+        sums[coding_fingerprint(lp.journal_line)] += float(lp.confidence)
+    return dict(sorted(sums.items(), key=lambda kv: -kv[1]))
 
 
 def neighbor_account_agreement(neighbor_rows: list[dict[str, Any]]) -> float:
@@ -35,8 +58,9 @@ def blend_confidence(
         final = min(model_confidence, 0.25)
         return final, {"reason": "no_neighbors", "model": model_confidence}
 
-    top_sim = distance_to_similarity(hits[0].distance)
-    mean_sim = sum(distance_to_similarity(h.distance) for h in hits[:5]) / min(5, len(hits))
+    ordered = sorted(hits, key=lambda h: h.distance)
+    top_sim = distance_to_similarity(ordered[0].distance)
+    mean_sim = sum(distance_to_similarity(h.distance) for h in ordered[:5]) / min(5, len(ordered))
     agree = neighbor_account_agreement(neighbor_rows)
     combined = (
         0.45 * model_confidence + 0.25 * top_sim + 0.15 * mean_sim + 0.15 * agree

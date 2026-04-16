@@ -1,5 +1,20 @@
 """Map Oracle / subledger GL text exports (tab-separated) into ``gl_lines`` load format.
 
+By default, loads only rows that have supplier metadata (non-empty ``INVOICE_NUM`` and at
+least one of ``SUPPLIER_NUMBER`` / ``SUPPLIER_CUSTMER_NAME``). Rows whose
+``GL_LINE_DESCRIPTION`` contains ``ankreg`` (any case) still load, but account and coding
+dimensions are cleared unless disabled — those lines are not treated as reliable coding
+ground truth.
+
+For ``join_key_mode`` ``invoice`` or ``entity_invoice``, Oracle detail rows are rolled up
+to **one output row per join key** (invoice number, or entity+invoice), summing amounts and
+merging metadata so ``gl_lines`` aligns with “one GL row per invoice” for linking to
+``invoice_extractions``. Use ``aggregate_by_invoice=False`` to keep one row per subledger
+line. ``fingerprint`` mode is always one row per source line.
+
+Join keys default to trimmed ``INVOICE_NUM`` so ``invoice_extractions`` can use the same
+value from ``invoice_number`` (see ``--join-key-mode`` / ``compute_join_key``).
+
 Historical files such as ``GL_202603.txt`` are tab-separated text with this header row
 (in order)::
 
@@ -27,6 +42,7 @@ import json
 import os
 import re
 import tempfile
+from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -146,21 +162,42 @@ def _row_fingerprint(row: dict[str, str]) -> str:
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
-def compute_join_key(row: dict[str, str]) -> str:
-    """
-    Stable key per GL line for this export shape.
+def normalize_invoice_join_value(s: str | None) -> str:
+    """Trim whitespace for matching GL ``INVOICE_NUM`` to extracted ``invoice_number``."""
+    return (s or "").strip()
 
-    When ``INVOICE_NUM`` is present, it is embedded so keys align with AP-style
-    invoice identifiers; a short content hash disambiguates multiple lines on
-    the same invoice with identical metadata.
+
+def row_has_supplier_columns(row: dict[str, str]) -> bool:
+    """True when the row carries AP-style supplier metadata (invoice + supplier id or name)."""
+    inv = normalize_invoice_join_value(row.get("INVOICE_NUM"))
+    sup = normalize_invoice_join_value(row.get("SUPPLIER_NUMBER"))
+    name = normalize_invoice_join_value(row.get("SUPPLIER_CUSTMER_NAME"))
+    return bool(inv and (sup or name))
+
+
+def gl_line_description_has_ankreg(row: dict[str, str]) -> bool:
+    return "ankreg" in (row.get("GL_LINE_DESCRIPTION") or "").casefold()
+
+
+def compute_join_key(row: dict[str, str], *, mode: str = "fingerprint") -> str:
+    """
+    Join key for linking ``gl_lines`` to ``invoice_extractions``.
+
+    * ``invoice`` — trimmed ``INVOICE_NUM`` only (matches extracted invoice number).
+    * ``entity_invoice`` — ``ENTITY|INVOICE_NUM`` to reduce cross-company collisions.
+    * ``fingerprint`` — legacy per-line key (entity, invoice, content hash).
     """
     entity = (row.get("ENTITY") or "").strip() or "UNK"
-    inv = (row.get("INVOICE_NUM") or "").strip()
-    jrnl = (row.get("JOURNAL_NUMBER") or "").strip() or "0"
-    fp = _row_fingerprint(row)
-    if inv:
-        return f"{entity}|{inv}|{fp}"
-    return f"{entity}|JRNL|{jrnl}|{fp}"
+    inv = normalize_invoice_join_value(row.get("INVOICE_NUM"))
+    if mode == "fingerprint":
+        jrnl = (row.get("JOURNAL_NUMBER") or "").strip() or "0"
+        fp = _row_fingerprint(row)
+        if inv:
+            return f"{entity}|{inv}|{fp}"
+        return f"{entity}|JRNL|{jrnl}|{fp}"
+    if mode == "entity_invoice":
+        return f"{entity}|{inv}" if inv else ""
+    return inv
 
 
 def _gl_line_id(row: dict[str, str], fp: str) -> str:
@@ -177,29 +214,192 @@ def _description(row: dict[str, str]) -> str:
     return gl_desc or hfm or ""
 
 
-def oracle_gl_row_to_load_tuple(row: dict[str, str]) -> tuple:
+def oracle_gl_row_to_load_tuple(
+    row: dict[str, str],
+    *,
+    join_key_mode: str = "invoice",
+    null_coding_when_ankreg: bool = True,
+) -> tuple:
     fp = _row_fingerprint(row)
     posting = _parse_booking_date(row.get("BOOKING_DATE", ""))
     p_start, p_end = _period_bounds(row.get("PERIOD", ""))
     desc = _description(row)
     raw = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+    strip_coding = bool(null_coding_when_ankreg) and gl_line_description_has_ankreg(row)
+    acct = (row.get("ACCOUNT") or "").strip()
+    dept = (row.get("DEPARTMENT") or "").strip()
+    prod = (row.get("PRODUCT") or "").strip()
+    ic = (row.get("IC") or "").strip()
+    proj = (row.get("PROJECT") or "").strip()
+    system = (row.get("SYSTEM") or "").strip()
+    reserve = (row.get("RESERVE") or "").strip()
+    if strip_coding:
+        acct = dept = prod = ic = proj = system = reserve = ""
     return (
-        compute_join_key(row),
+        compute_join_key(row, mode=join_key_mode),
         _gl_line_id(row, fp),
         posting.isoformat() if posting else "",
         (row.get("ENTITY") or "").strip(),
-        (row.get("ACCOUNT") or "").strip(),
-        (row.get("DEPARTMENT") or "").strip(),
-        (row.get("PRODUCT") or "").strip(),
-        (row.get("IC") or "").strip(),
-        (row.get("PROJECT") or "").strip(),
-        (row.get("SYSTEM") or "").strip(),
-        (row.get("RESERVE") or "").strip(),
+        acct,
+        dept,
+        prod,
+        ic,
+        proj,
+        system,
+        reserve,
         _format_amount_for_bigquery_csv(row.get("NET_ACCOUNTED", "")),
         "",
         p_start.isoformat() if p_start else "",
         p_end.isoformat() if p_end else "",
         desc,
+        raw,
+    )
+
+
+_RAW_AGG_JSON_MAX_CHARS = 950_000
+
+
+def _format_decimal_amount_for_bq(amount: Decimal) -> str:
+    try:
+        q = amount.quantize(_BQ_NUMERIC_QUANTUM, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        return ""
+    return format(q, "f")
+
+
+def _row_coding_fields(
+    row: dict[str, str], *, null_coding_when_ankreg: bool
+) -> tuple[str, str, str, str, str, str, str]:
+    strip_coding = bool(null_coding_when_ankreg) and gl_line_description_has_ankreg(row)
+    acct = (row.get("ACCOUNT") or "").strip()
+    dept = (row.get("DEPARTMENT") or "").strip()
+    prod = (row.get("PRODUCT") or "").strip()
+    ic = (row.get("IC") or "").strip()
+    proj = (row.get("PROJECT") or "").strip()
+    system = (row.get("SYSTEM") or "").strip()
+    reserve = (row.get("RESERVE") or "").strip()
+    if strip_coding:
+        acct = dept = prod = ic = proj = system = reserve = ""
+    return acct, dept, prod, ic, proj, system, reserve
+
+
+def _raw_json_for_invoice_agg(rows: list[dict[str, str]]) -> str:
+    """Serialize source rows for audit; shrink if JSON would exceed BigQuery practical limits."""
+    n = len(rows)
+    lines = list(rows)
+    while True:
+        payload = {"aggregated_invoice_gl": True, "line_count": n, "lines": lines}
+        s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(s) <= _RAW_AGG_JSON_MAX_CHARS:
+            return s
+        if len(lines) <= 1:
+            return json.dumps(
+                {
+                    "aggregated_invoice_gl": True,
+                    "line_count": n,
+                    "truncated": True,
+                    "fieldnames": sorted(lines[0].keys()) if lines else [],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        lines = lines[: max(1, len(lines) // 2)]
+
+
+def _aggregate_oracle_rows_to_load_tuple(
+    rows: list[dict[str, str]],
+    *,
+    join_key: str,
+    join_key_mode: str,
+    null_coding_when_ankreg: bool,
+) -> tuple:
+    if not rows:
+        raise ValueError("aggregate requires at least one row")
+    sorted_rows = sorted(
+        rows,
+        key=lambda r: (
+            _parse_booking_date(r.get("BOOKING_DATE", "")) or date.min,
+            (r.get("JOURNAL_NUMBER") or "").strip(),
+            (r.get("ACCOUNT") or "").strip(),
+        ),
+    )
+    for r in sorted_rows:
+        if compute_join_key(r, mode=join_key_mode) != join_key:
+            raise ValueError("aggregate group contains mismatched join keys")
+
+    total = Decimal("0")
+    any_amount = False
+    posting_dates: list[date] = []
+    period_starts: list[date] = []
+    period_ends: list[date] = []
+    entities: set[str] = set()
+    codings: list[tuple[str, str, str, str, str, str, str]] = []
+    desc_parts: list[str] = []
+    seen_desc: set[str] = set()
+
+    for row in sorted_rows:
+        amt = _parse_amount(row.get("NET_ACCOUNTED", ""))
+        if amt is not None:
+            total += amt
+            any_amount = True
+        pd = _parse_booking_date(row.get("BOOKING_DATE", ""))
+        if pd is not None:
+            posting_dates.append(pd)
+        ps, pe = _period_bounds(row.get("PERIOD", ""))
+        if ps is not None:
+            period_starts.append(ps)
+        if pe is not None:
+            period_ends.append(pe)
+        ent = (row.get("ENTITY") or "").strip()
+        if ent:
+            entities.add(ent)
+        codings.append(_row_coding_fields(row, null_coding_when_ankreg=null_coding_when_ankreg))
+        d = _description(row)
+        if d and d not in seen_desc:
+            seen_desc.add(d)
+            desc_parts.append(d)
+
+    def _unanimous(values: set[str]) -> str:
+        if len(values) == 1:
+            return next(iter(values))
+        return ""
+
+    company = _unanimous(entities)
+    dims: list[str] = []
+    for i in range(7):
+        col = {t[i] for t in codings if t[i]}
+        dims.append(_unanimous(col) if col else "")
+
+    desc_joined = " | ".join(desc_parts)
+    if len(desc_joined) > 16000:
+        desc_joined = desc_joined[:15997] + "..."
+
+    posting_min = min(posting_dates) if posting_dates else None
+    p_start = min(period_starts) if period_starts else None
+    p_end = max(period_ends) if period_ends else None
+
+    h = hashlib.sha256(join_key.encode("utf-8")).hexdigest()[:14]
+    gl_line_id = f"AGG-{h}"
+    amount_str = _format_decimal_amount_for_bq(total) if any_amount else ""
+    raw = _raw_json_for_invoice_agg(sorted_rows)
+
+    return (
+        join_key,
+        gl_line_id,
+        posting_min.isoformat() if posting_min else "",
+        company,
+        dims[0],
+        dims[1],
+        dims[2],
+        dims[3],
+        dims[4],
+        dims[5],
+        dims[6],
+        amount_str,
+        "",
+        p_start.isoformat() if p_start else "",
+        p_end.isoformat() if p_end else "",
+        desc_joined,
         raw,
     )
 
@@ -242,14 +442,85 @@ def iter_oracle_gl_rows(path: Path, *, encoding: str | None = None) -> Iterator[
         yield {k: (v if v is not None else "") for k, v in raw.items()}
 
 
-def oracle_gl_tsv_to_csv_bytes(path: Path, *, encoding: str | None = None) -> bytes:
-    """Build UTF-8 CSV matching ``sql/bigquery/gl_load_schema.json`` column order."""
+_GL_JOIN_KEY_MODES = frozenset({"invoice", "entity_invoice", "fingerprint"})
+
+
+def oracle_gl_tsv_to_csv_bytes(
+    path: Path,
+    *,
+    encoding: str | None = None,
+    max_rows: int | None = None,
+    join_key_mode: str = "invoice",
+    supplier_rows_only: bool = True,
+    null_coding_when_ankreg: bool = True,
+    aggregate_by_invoice: bool = True,
+) -> tuple[bytes, int, int]:
+    """
+    Build UTF-8 CSV matching ``sql/bigquery/gl_load_schema.json`` column order.
+
+    Returns ``(csv_bytes, rows_written, detail_rows_consumed)`` where ``rows_written`` is the number
+    of data rows in the CSV (after rollup, one per join key) and ``detail_rows_consumed`` is how
+    many matching subledger source rows were read (equals ``rows_written`` when not aggregating).
+
+    With ``aggregate_by_invoice`` and ``join_key_mode`` ``invoice`` or ``entity_invoice``, each
+    distinct join key yields one CSV row (sums ``NET_ACCOUNTED``, merges descriptions, etc.).
+    ``max_rows`` then caps how many **matching subledger detail rows** are read before flushing
+    groups (the last invoice in the cap may be incomplete).
+
+    With ``join_key_mode`` ``fingerprint`` or ``aggregate_by_invoice=False``, each matching
+    source row is one CSV row; ``max_rows`` caps those rows directly.
+    """
+    if join_key_mode not in _GL_JOIN_KEY_MODES:
+        raise ValueError(
+            f"join_key_mode must be one of {sorted(_GL_JOIN_KEY_MODES)}, got {join_key_mode!r}"
+        )
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
     writer.writerow(_GL_HEADER)
+    use_aggregate = aggregate_by_invoice and join_key_mode in ("invoice", "entity_invoice")
+
+    if not use_aggregate:
+        n = 0
+        for row in iter_oracle_gl_rows(path, encoding=encoding):
+            if supplier_rows_only and not row_has_supplier_columns(row):
+                continue
+            jk = compute_join_key(row, mode=join_key_mode)
+            if not jk:
+                continue
+            writer.writerow(
+                oracle_gl_row_to_load_tuple(
+                    row,
+                    join_key_mode=join_key_mode,
+                    null_coding_when_ankreg=null_coding_when_ankreg,
+                )
+            )
+            n += 1
+            if max_rows is not None and n >= max_rows:
+                break
+        return buf.getvalue().encode("utf-8"), n, n
+
+    groups: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
+    consumed = 0
     for row in iter_oracle_gl_rows(path, encoding=encoding):
-        writer.writerow(oracle_gl_row_to_load_tuple(row))
-    return buf.getvalue().encode("utf-8")
+        if supplier_rows_only and not row_has_supplier_columns(row):
+            continue
+        jk = compute_join_key(row, mode=join_key_mode)
+        if not jk:
+            continue
+        groups.setdefault(jk, []).append(row)
+        consumed += 1
+        if max_rows is not None and consumed >= max_rows:
+            break
+    for jk, grouped in groups.items():
+        writer.writerow(
+            _aggregate_oracle_rows_to_load_tuple(
+                grouped,
+                join_key=jk,
+                join_key_mode=join_key_mode,
+                null_coding_when_ankreg=null_coding_when_ankreg,
+            )
+        )
+    return buf.getvalue().encode("utf-8"), len(groups), consumed
 
 
 def _parse_gs_uri(uri: str) -> tuple[str, str]:
@@ -269,6 +540,11 @@ def load_oracle_gl_tsv_paths_to_bigquery(
     write_disposition: str = bigquery.WriteDisposition.WRITE_APPEND,
     schema_file: Path | None = None,
     encoding: str | None = None,
+    max_rows: int | None = None,
+    join_key_mode: str = "invoice",
+    supplier_rows_only: bool = True,
+    null_coding_when_ankreg: bool = True,
+    aggregate_by_invoice: bool = True,
 ) -> str:
     """
     Transform each tab-separated GL file and load into ``gl_lines``.
@@ -292,12 +568,34 @@ def load_oracle_gl_tsv_paths_to_bigquery(
     )
     if schema_path.exists():
         job_config.schema = client.schema_from_json(str(schema_path))
+    remaining = max_rows
+    total_written = 0
     for i, path in enumerate(resolved):
-        data = oracle_gl_tsv_to_csv_bytes(path, encoding=encoding)
+        data, out_rows, detail_used = oracle_gl_tsv_to_csv_bytes(
+            path,
+            encoding=encoding,
+            max_rows=remaining,
+            join_key_mode=join_key_mode,
+            supplier_rows_only=supplier_rows_only,
+            null_coding_when_ankreg=null_coding_when_ankreg,
+            aggregate_by_invoice=aggregate_by_invoice,
+        )
+        if out_rows == 0:
+            continue
+        total_written += out_rows
         job = client.load_table_from_file(io.BytesIO(data), full_table, job_config=job_config)
         job.result()
         if i == 0:
             job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND
+        if remaining is not None:
+            remaining -= detail_used
+            if remaining <= 0:
+                break
+    if total_written == 0:
+        raise ValueError(
+            "No GL rows matched filters (supplier columns required by default; "
+            "check source or pass supplier_rows_only=False)."
+        )
     return full_table
 
 
@@ -310,6 +608,11 @@ def load_oracle_gl_tsv_to_bigquery(
     encoding: str | None = None,
     directory_glob: str = "GL_*.txt",
     recursive: bool = False,
+    max_rows: int | None = None,
+    join_key_mode: str = "invoice",
+    supplier_rows_only: bool = True,
+    null_coding_when_ankreg: bool = True,
+    aggregate_by_invoice: bool = True,
 ) -> str:
     """
     Transform a tab-separated GL export (e.g. ``GL_202603.txt``) and load into ``gl_lines``.
@@ -321,6 +624,7 @@ def load_oracle_gl_tsv_to_bigquery(
     ``encoding`` defaults to UTF-8 (with BOM allowed); if that fails, Windows-1252 is used.
     Pass an explicit encoding (e.g. ``"cp1252"``) to force one codec.
     """
+    settings = require_settings()
     cleanup: Path | None = None
     try:
         if isinstance(source, str) and source.startswith("gs://"):
@@ -347,6 +651,11 @@ def load_oracle_gl_tsv_to_bigquery(
                 write_disposition=write_disposition,
                 schema_file=schema_file,
                 encoding=encoding,
+                max_rows=max_rows,
+                join_key_mode=join_key_mode,
+                supplier_rows_only=supplier_rows_only,
+                null_coding_when_ankreg=null_coding_when_ankreg,
+                aggregate_by_invoice=aggregate_by_invoice,
             )
         if not path.is_file():
             raise FileNotFoundError(f"Not a file or directory: {path}")
@@ -356,6 +665,11 @@ def load_oracle_gl_tsv_to_bigquery(
             write_disposition=write_disposition,
             schema_file=schema_file,
             encoding=encoding,
+            max_rows=max_rows,
+            join_key_mode=join_key_mode,
+            supplier_rows_only=supplier_rows_only,
+            null_coding_when_ankreg=null_coding_when_ankreg,
+            aggregate_by_invoice=aggregate_by_invoice,
         )
     finally:
         if cleanup is not None:
